@@ -1,0 +1,295 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Minecraft Cross-Platform Server (Java + Bedrock via GeyserMC)
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.medium, t3.large, t3.xlarge, m5.large, m5.xlarge]
+    Description: EC2 instance type (t3.medium = ~20 players, t3.large = ~40)
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: SSH key pair for server access
+
+  ServerMemory:
+    Type: String
+    Default: 2G
+    Description: Memory allocated to Minecraft server JVM (use half of instance RAM)
+
+  BackupBucketName:
+    Type: String
+    Default: minecraft-world-backups
+    Description: S3 bucket name for world backups
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Amazon Linux 2023 AMI
+
+Resources:
+
+  # --- Networking ---
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: minecraft-vpc
+        - Key: Project
+          Value: minecraft-server
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: minecraft-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: minecraft-public-subnet
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  # --- Security Group ---
+  MinecraftSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Minecraft server ports (Java + Bedrock) and SSH
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # SSH access
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        # Java Edition
+        - IpProtocol: tcp
+          FromPort: 25565
+          ToPort: 25565
+          CidrIp: 0.0.0.0/0
+        # Bedrock Edition (UDP)
+        - IpProtocol: udp
+          FromPort: 19132
+          ToPort: 19132
+          CidrIp: 0.0.0.0/0
+        # BedrockConnect DNS (for Xbox/Switch)
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: minecraft-sg
+
+  # --- S3 Backup Bucket ---
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BackupBucketName}-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldBackups
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Project
+          Value: minecraft-server
+
+  # --- IAM Role for EC2 (S3 backup access) ---
+  MinecraftInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MinecraftBackupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt BackupBucket.Arn
+                  - !Sub '${BackupBucket.Arn}/*'
+
+  MinecraftInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref MinecraftInstanceRole
+
+  # --- Elastic IP ---
+  MinecraftEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Tags:
+        - Key: Name
+          Value: minecraft-eip
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref MinecraftServer
+      AllocationId: !GetAtt MinecraftEIP.AllocationId
+
+  # --- EC2 Instance ---
+  MinecraftServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref MinecraftInstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref MinecraftSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: minecraft-server
+        - Key: Project
+          Value: minecraft-server
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          exec > /var/log/minecraft-setup.log 2>&1
+
+          echo "=== Minecraft Server Setup Starting ==="
+
+          # Install Java 21 (required for modern MC versions)
+          dnf install -y java-21-amazon-corretto-headless
+
+          # Create minecraft user
+          useradd -r -m -d /opt/minecraft minecraft
+
+          # Create server directory
+          mkdir -p /opt/minecraft/server/plugins
+          cd /opt/minecraft/server
+
+          # Download PaperMC
+          PAPER_VERSION="1.21.4"
+          PAPER_API="https://api.papermc.io/v2/projects/paper/versions/${!PAPER_VERSION}"
+          LATEST_BUILD=$(curl -s $PAPER_API | python3 -c "import sys,json; builds=json.load(sys.stdin)['builds']; print(builds[-1])")
+          PAPER_JAR="paper-${!PAPER_VERSION}-${!LATEST_BUILD}.jar"
+          curl -o server.jar "$PAPER_API/builds/${!LATEST_BUILD}/downloads/${!PAPER_JAR}"
+
+          # Accept EULA
+          echo "eula=true" > eula.txt
+
+          # Server properties
+          cat > server.properties << 'PROPS'
+          server-port=25565
+          gamemode=survival
+          difficulty=normal
+          max-players=20
+          view-distance=12
+          motd=\u00a7b\u00a7lCross-Platform Minecraft Server
+          online-mode=true
+          enable-command-block=true
+          spawn-protection=0
+          PROPS
+
+          # Download GeyserMC (Bedrock bridge)
+          GEYSER_URL="https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot"
+          curl -o plugins/Geyser-Spigot.jar -L "$GEYSER_URL"
+
+          # Download Floodgate (lets Bedrock players join without Java account)
+          FLOODGATE_URL="https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot"
+          curl -o plugins/Floodgate-Spigot.jar -L "$FLOODGATE_URL"
+
+          # Set ownership
+          chown -R minecraft:minecraft /opt/minecraft
+
+          # Create systemd service
+          cat > /etc/systemd/system/minecraft.service << 'SERVICE'
+          [Unit]
+          Description=Minecraft Server
+          After=network.target
+
+          [Service]
+          User=minecraft
+          WorkingDirectory=/opt/minecraft/server
+          ExecStart=/usr/bin/java -Xms${ServerMemory} -Xmx${ServerMemory} -XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -jar server.jar nogui
+          ExecStop=/bin/kill -SIGINT $MAINPID
+          Restart=on-failure
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          # Enable and start
+          systemctl daemon-reload
+          systemctl enable minecraft
+          systemctl start minecraft
+
+          echo "=== Minecraft Server Setup Complete ==="
+
+Outputs:
+  ServerIP:
+    Description: Minecraft server public IP address
+    Value: !Ref MinecraftEIP
+
+  JavaConnectionString:
+    Description: Connect from Java Edition
+    Value: !Sub '${MinecraftEIP}:25565'
+
+  BedrockConnectionString:
+    Description: Connect from Bedrock Edition (Xbox, PS, Switch, Mobile)
+    Value: !Sub '${MinecraftEIP}:19132'
+
+  SSHCommand:
+    Description: SSH into the server
+    Value: !Sub 'ssh -i ${KeyPairName}.pem ec2-user@${MinecraftEIP}'
+
+  BackupBucketName:
+    Description: S3 bucket for world backups
+    Value: !Ref BackupBucket
