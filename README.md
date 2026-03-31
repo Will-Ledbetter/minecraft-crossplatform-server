@@ -6,6 +6,10 @@ A Minecraft server running on AWS EC2 that supports **all platforms simultaneous
 
 Uses **GeyserMC** to bridge Bedrock players into the Java server.
 
+## LinkedIn Post
+
+[See it in action](https://www.linkedin.com/posts/will-ledbetter-114318167_minecraft-is-back-for-me-i-recently-heard-activity-7442794850284081152-zq0f?utm_source=share&utm_medium=member_desktop&rcm=ACoAACe8W6ABz_yW6tZUwf4zTku75hhXakj6lxU)
+
 ## Architecture
 - **EC2 Instance** (t3.medium or larger) with Elastic IP
 - **Paper MC** server (high-performance Java server)
